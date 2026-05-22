@@ -1,0 +1,2 @@
+      22 +TOKEN = os.getenv("TELEGRAM_TOKEN", "8741205884:AAF2A4hU8Zoy7zEDOpD1Ikx_4tuQ1yWwykQ")
+      23 +OWNER_ID = int(os.getenv("TELEGRAM_USER_ID", "8555731733"))
