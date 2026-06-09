@@ -11,17 +11,30 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+_GLOBAL_TIMEOUT = 90
 
 
-async def executar_megafonar(loja_url: str, cookie_value: str) -> int:
+async def _run_megafonar(loja_url: str, cookie_value: str) -> int:
     """
     Opens the store page and clicks all available megafonar buttons.
     Returns the number of boosts performed, or -1 if not logged in.
+    Raises on unrecoverable errors.
     """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent=_USER_AGENT)
+    try:
+        pw = await async_playwright().start()
+    except Exception as e:
+        logger.error(f"Failed to start Playwright: {e}")
+        raise RuntimeError(f"Playwright start failed: {e}") from e
 
+    try:
+        browser = await pw.chromium.launch(headless=True)
+    except Exception as e:
+        logger.error(f"Failed to launch browser: {e}")
+        await pw.stop()
+        raise RuntimeError(f"Browser launch failed: {e}") from e
+
+    try:
+        context = await browser.new_context(user_agent=_USER_AGENT)
         await context.add_cookies([{
             "name": _COOKIE_NAME,
             "value": cookie_value,
@@ -35,10 +48,8 @@ async def executar_megafonar(loja_url: str, cookie_value: str) -> int:
             await page.goto(loja_url, wait_until="domcontentloaded", timeout=30_000)
         except PWTimeout:
             logger.error(f"Timeout loading {loja_url}")
-            await browser.close()
             return 0
 
-        # Verify login
         logged_in = any([
             await page.query_selector("[data-testid='user-menu']"),
             await page.query_selector("[class*='user-avatar']"),
@@ -46,15 +57,12 @@ async def executar_megafonar(loja_url: str, cookie_value: str) -> int:
         ])
         if not logged_in:
             logger.warning(f"Not logged in — {loja_url}")
-            await browser.close()
             return -1
 
-        # Scroll to lazy-load all product cards
         for _ in range(6):
             await page.evaluate("window.scrollBy(0, 800)")
             await asyncio.sleep(0.8)
 
-        # Click every available megafonar button
         buttons = await page.query_selector_all("button")
         count = 0
         for btn in buttons:
@@ -67,5 +75,15 @@ async def executar_megafonar(loja_url: str, cookie_value: str) -> int:
             except Exception:
                 continue
 
-        await browser.close()
         return count
+    finally:
+        await browser.close()
+        await pw.stop()
+
+
+async def executar_megafonar(loja_url: str, cookie_value: str) -> int:
+    """Wrapper with global timeout to prevent infinite hangs."""
+    return await asyncio.wait_for(
+        _run_megafonar(loja_url, cookie_value),
+        timeout=_GLOBAL_TIMEOUT,
+    )

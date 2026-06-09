@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import time
+import traceback
 from datetime import datetime
 from functools import wraps
 
@@ -24,6 +25,8 @@ load_dotenv()
 
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 OWNER_ID = int(os.environ["TELEGRAM_USER_ID"])
+
+MAX_CONSECUTIVE_ERRORS = 3
 
 logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -57,7 +60,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/rename — rename a store\n"
         "/remove — remove a store\n"
         "/resume — today's summary\n"
-        "/setinterval — change a store's run interval",
+        "/setinterval — change a store's run interval\n"
+        "/health — scheduler health & error info\n"
+        "/kick — force reset all stores (unstuck)\n"
+        "/fixme — diagnose & repair everything",
         parse_mode="Markdown",
     )
 
@@ -81,11 +87,13 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         wait_str = f"{int(wait_sec // 60)}m {int(wait_sec % 60)}s" if wait_sec > 0 else "now"
         icon = "🟢" if s["active"] else "🔴"
         cookie_preview = s["cookie"][:20] + "..."
+        errors = s.get("consecutive_errors", 0)
+        err_str = f" | ⚠️ {errors} errors" if errors > 0 else ""
         lines.append(
             f"{icon} *{s['name']}*\n"
             f"   Interval: every {s.get('interval_minutes', 20)} min | next in: {wait_str}\n"
             f"   Last boost: {last_str}\n"
-            f"   Today: {stats['total_boosts']} boosts / {stats['rounds']} rounds\n"
+            f"   Today: {stats['total_boosts']} boosts / {stats['rounds']} rounds{err_str}\n"
             f"   Cookie: `{cookie_preview}`\n"
         )
 
@@ -115,8 +123,111 @@ async def _send_resume(bot, chat_id: int) -> None:
     await bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
 
 
+# ── /health ───────────────────────────────────────────────────────────────────
+@owner_only
+async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    heartbeat = store_mgr.get_heartbeat()
+    stores = store_mgr.all_stores()
+
+    lines = ["🩺 *Bot Health*\n"]
+
+    if heartbeat:
+        hb_time = datetime.fromisoformat(heartbeat)
+        age = (datetime.now() - hb_time).total_seconds()
+        if age < 60:
+            lines.append(f"💓 Heartbeat: {int(age)}s ago — *healthy*")
+        elif age < 300:
+            lines.append(f"💛 Heartbeat: {int(age // 60)}m ago — *ok*")
+        else:
+            lines.append(f"🔴 Heartbeat: {int(age // 60)}m ago — *STALE*")
+    else:
+        lines.append("⚪ Heartbeat: never recorded")
+
+    if stores:
+        lines.append("\n*Store Errors:*")
+        for sid, s in stores.items():
+            errors = s.get("consecutive_errors", 0)
+            active = "🟢" if s["active"] else "🔴 PAUSED"
+            if errors > 0:
+                lines.append(f"  {active} {s['name']}: {errors} consecutive errors")
+            else:
+                lines.append(f"  {active} {s['name']}: no errors")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ── /kick ─────────────────────────────────────────────────────────────────────
+@owner_only
+async def cmd_kick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    names = store_mgr.kick_all_stores()
+    if not names:
+        await update.message.reply_text("No stores to kick.")
+        return
+    store_list = ", ".join(names)
+    await update.message.reply_text(
+        f"⚡ *Kicked {len(names)} store(s)*: {store_list}\n\n"
+        "All stores reactivated, errors cleared, running immediately.",
+        parse_mode="Markdown",
+    )
+
+
+# ── /fixme ────────────────────────────────────────────────────────────────────
+@owner_only
+async def cmd_fixme(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("🔧 *Phase 1: Quick Reset...*", parse_mode="Markdown")
+
+    # Phase 1: Reset everything
+    stores_before = store_mgr.all_stores()
+    fixes = []
+    for sid, s in stores_before.items():
+        if not s["active"]:
+            fixes.append(f"  ✅ Reactivated *{s['name']}*")
+        if s.get("consecutive_errors", 0) > 0:
+            fixes.append(f"  ✅ Cleared {s['consecutive_errors']} errors on *{s['name']}*")
+
+    names = store_mgr.kick_all_stores()
+
+    if fixes:
+        await update.message.reply_text(
+            "🔧 *Fixes applied:*\n" + "\n".join(fixes),
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text("✅ No issues found — all stores were healthy.")
+
+    # Phase 2: Test-boost each store
+    await update.message.reply_text(
+        f"🔧 *Phase 2: Testing {len(names)} store(s)...*\n"
+        "This may take a minute.",
+        parse_mode="Markdown",
+    )
+
+    stores = store_mgr.all_stores()
+    results = []
+    for sid, s in stores.items():
+        try:
+            count = await runner.executar_megafonar(s["url"], s["cookie"])
+            if count == -1:
+                results.append(f"  🔴 *{s['name']}*: cookie expired — update with /addcookie")
+            elif count == 0:
+                results.append(f"  🟡 *{s['name']}*: connected but 0 boosts available")
+            else:
+                store_mgr.record_boost(sid, count)
+                interval = s.get("interval_minutes", 20)
+                store_mgr.set_next_run(sid, time.time() + interval * 60)
+                results.append(f"  🟢 *{s['name']}*: working — {count} boosts done")
+        except asyncio.TimeoutError:
+            results.append(f"  🔴 *{s['name']}*: timed out (90s) — site may be down")
+        except Exception as e:
+            results.append(f"  🔴 *{s['name']}*: error — `{e}`")
+
+    await update.message.reply_text(
+        "🔧 *Test Results:*\n" + "\n".join(results),
+        parse_mode="Markdown",
+    )
+
+
 # ── /addcookie conversation ───────────────────────────────────────────────────
-# Flow: cookie → interval → name → URL
 
 @owner_only
 async def cmd_addcookie(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -292,44 +403,102 @@ async def _scheduler(app: Application) -> None:
     resume_sent_today: str | None = None
 
     while True:
-        now = time.time()
-        stores = store_mgr.all_stores()
+        try:
+            now = time.time()
+            stores = store_mgr.all_stores()
 
-        for sid, s in stores.items():
-            if not s.get("active"):
-                continue
-            if now < s.get("next_run", 0):
-                continue  # not due yet
+            for sid, s in stores.items():
+                if not s.get("active"):
+                    continue
+                if now < s.get("next_run", 0):
+                    continue
 
-            logger.info(f"Running: {s['name']} (every {s.get('interval_minutes', 20)} min)")
+                logger.info(f"Running: {s['name']} (every {s.get('interval_minutes', 20)} min)")
+                interval = s.get("interval_minutes", 20)
+                try:
+                    count = await runner.executar_megafonar(s["url"], s["cookie"])
+                    if count == -1:
+                        errors = store_mgr.increment_errors(sid)
+                        await app.bot.send_message(
+                            OWNER_ID,
+                            f"⚠️ *{s['name']}*: cookie expired or not logged in."
+                            f"\n({errors}/{MAX_CONSECUTIVE_ERRORS} consecutive errors)",
+                            parse_mode="Markdown",
+                        )
+                    else:
+                        store_mgr.record_boost(sid, count)
+                        store_mgr.set_next_run(sid, now + interval * 60)
+                        logger.info(f"{s['name']}: {count} boosts — next in {interval} min")
+                        continue
+                except asyncio.TimeoutError:
+                    errors = store_mgr.increment_errors(sid)
+                    logger.error(f"{s['name']}: global timeout (90s)")
+                    try:
+                        await app.bot.send_message(
+                            OWNER_ID,
+                            f"⏱ *{s['name']}*: timed out (90s)"
+                            f"\n({errors}/{MAX_CONSECUTIVE_ERRORS} consecutive errors)",
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        pass
+                except Exception as e:
+                    errors = store_mgr.increment_errors(sid)
+                    logger.error(f"{s['name']} error: {e}")
+                    try:
+                        await app.bot.send_message(
+                            OWNER_ID,
+                            f"❌ *{s['name']}*: error — `{e}`"
+                            f"\n({errors}/{MAX_CONSECUTIVE_ERRORS} consecutive errors)",
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        pass
+
+                store_mgr.set_next_run(sid, now + interval * 60)
+
+                current_errors = store_mgr.get_store(sid).get("consecutive_errors", 0)
+                if current_errors >= MAX_CONSECUTIVE_ERRORS:
+                    store_mgr.deactivate_store(sid)
+                    logger.warning(f"{s['name']}: auto-paused after {MAX_CONSECUTIVE_ERRORS} consecutive errors")
+                    try:
+                        await app.bot.send_message(
+                            OWNER_ID,
+                            f"🛑 *{s['name']}* auto-paused after {MAX_CONSECUTIVE_ERRORS} consecutive errors.\n"
+                            "Use /kick or /fixme to reactivate.",
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        pass
+
+            # Daily resume at 23:55
+            dt = datetime.now()
+            today = dt.strftime("%Y-%m-%d")
+            if dt.hour == 23 and dt.minute >= 55 and resume_sent_today != today:
+                await _send_resume(app.bot, OWNER_ID)
+                resume_sent_today = today
+
+            store_mgr.update_heartbeat()
+
+        except Exception as e:
+            logger.exception("Scheduler crash — auto-recovering in 10s")
             try:
-                count = await runner.executar_megafonar(s["url"], s["cookie"])
-                if count == -1:
-                    await app.bot.send_message(
-                        OWNER_ID,
-                        f"⚠️ *{s['name']}*: cookie expired or not logged in.",
-                        parse_mode="Markdown",
-                    )
-                else:
-                    store_mgr.record_boost(sid, count)
-                    interval = s.get("interval_minutes", 20)
-                    store_mgr.set_next_run(sid, now + interval * 60)
-                    logger.info(f"{s['name']}: {count} boosts — next in {interval} min")
-            except Exception as e:
-                logger.error(f"{s['name']} error: {e}")
+                await app.bot.send_message(
+                    OWNER_ID,
+                    f"🔄 *Scheduler crashed*: `{e}`\n\nAuto-recovering in 10s...",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(10)
+            continue
 
-        # Daily resume at 23:55 (once per day)
-        dt = datetime.now()
-        today = dt.strftime("%Y-%m-%d")
-        if dt.hour == 23 and dt.minute >= 55 and resume_sent_today != today:
-            await _send_resume(app.bot, OWNER_ID)
-            resume_sent_today = today
-
-        await asyncio.sleep(30)  # check every 30 seconds
+        await asyncio.sleep(30)
 
 
 async def _post_init(app: Application) -> None:
     asyncio.create_task(_scheduler(app))
+    logger.info("Scheduler started")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -368,6 +537,9 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("health", cmd_health))
+    app.add_handler(CommandHandler("kick", cmd_kick))
+    app.add_handler(CommandHandler("fixme", cmd_fixme))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CallbackQueryHandler(remove_cb, pattern=r"^rm_"))
     app.add_handler(add_conv)
