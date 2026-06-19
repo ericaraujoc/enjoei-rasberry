@@ -25,7 +25,7 @@ async def _get_csrf_token(client: httpx.AsyncClient) -> str | None:
 
 
 async def _get_product_ids(client: httpx.AsyncClient, store_url: str) -> list[int]:
-    resp = await client.get(store_url)
+    resp = await client.get(f"{_BASE_URL}/perfil/minha-lojinha")
     if resp.status_code != 200:
         return []
 
@@ -34,10 +34,7 @@ async def _get_product_ids(client: httpx.AsyncClient, store_url: str) -> list[in
     for match in re.findall(r'/p/[^"\'\s]*?-(\d{5,})', resp.text):
         ids.add(int(match))
 
-    for match in re.findall(r'product_id["\s:=]+(\d{5,})', resp.text, re.IGNORECASE):
-        ids.add(int(match))
-
-    for match in re.findall(r'"id"\s*:\s*(\d{5,})', resp.text):
+    for match in re.findall(r'product[_-]id["\s:=]+["\']?(\d{5,})', resp.text, re.IGNORECASE):
         ids.add(int(match))
 
     for match in re.findall(r'/produtos/(\d{5,})', resp.text):
